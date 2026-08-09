@@ -1,0 +1,14 @@
+# ESP-IDF build directory
+build/
+
+# Local Wi-Fi credentials
+main/secrets.h
+
+# IDE files
+.settings/
+.project
+.cproject
+
+# OS files
+.DS_Store
+Thumbs.db
