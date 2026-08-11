@@ -19,6 +19,8 @@
 #include "esp_wifi.h"
 #include "lwip/inet.h"
 
+#include "esp_random.h"
+
 
 typedef enum{
 	WIFI_STATE_INIT = 0,
@@ -37,8 +39,9 @@ static wifi_state_t wifi_state = WIFI_STATE_INIT;
 #define WIFI_MANAGER_EVENT_DISCONNECTED 		(1UL << 3)
 #define WIFI_MANAGER_EVENT_ALL (WIFI_MANAGER_EVENT_START | WIFI_MANAGER_EVENT_CONNECTED | WIFI_MANAGER_EVENT_GOT_IP | WIFI_MANAGER_EVENT_DISCONNECTED)
 
-uint32_t  WIFI_RECONECT_DELAY_MS = 2000;
-uint32_t MAX_RECONNEKT_ATTEMPTS = 10;
+uint32_t WIFI_RECONECT_DELAY_MS = 2000U;
+uint32_t MAX_RECONNEKT_ATTEMPTS = 15U;
+uint32_t WIFI_MAX_RECONNECT_DELAY_MS = 30000U;
 
 static wifi_err_reason_t last_disconnect_reason = WIFI_REASON_UNSPECIFIED;
 static uint32_t reconnect_attempts = 0;
@@ -58,8 +61,41 @@ static TaskHandle_t wifi_manager_task_handle = NULL;
 #define WIFI_MANAGER_TASK_PRIORITY			5
 #define TEST_CORE							1
 
+static uint32_t wifi_get_jitter(uint32_t max_jitter)
+{
+	return esp_random()%(max_jitter + 1);
 
+	
+}
 
+static uint32_t wifi_get_backoff_delay(uint32_t attempt)
+{
+	uint32_t delay = WIFI_RECONECT_DELAY_MS;
+	for(uint32_t i = 1; i < attempt; i++)
+	{
+		if(delay >= WIFI_MAX_RECONNECT_DELAY_MS/2)
+		{
+			delay = WIFI_MAX_RECONNECT_DELAY_MS;
+			break;
+		}
+		delay = delay*2;
+	}
+	if(delay > WIFI_MAX_RECONNECT_DELAY_MS)
+	{
+		delay = WIFI_MAX_RECONNECT_DELAY_MS;
+	}
+	
+	return delay;
+}
+static uint32_t wifi_get_retry_delay(uint32_t attempt)
+{
+	uint32_t backoff = wifi_get_backoff_delay(attempt);
+	uint32_t jitter = wifi_get_jitter(500);
+	
+	//ESP_LOGI("TEST RANDOM ","backoff :%" PRIu32 " ms" "jitter :%" PRIu32 "ms" , backoff, jitter);
+	
+	return backoff + jitter;
+}
 
 static const char *wifi_disconnect_reason_to_string(wifi_err_reason_t reason)
 {
@@ -335,24 +371,28 @@ static void wifi_manager_task(void *parameters)
 			
 			wifi_manager_set_state(WIFI_STATE_DISCONNECTED);
 			
+			// Cteate delay depent of attempt. 2,4,8,16,30, 30, 30 seconda + random part from 0 to 500 mSec
+			uint32_t delay = wifi_get_retry_delay(reconnect_attempts);
+			
 			// For example, reconect after 2 seconds
-			ESP_LOGI(MANAGER_TAG, "MANAGER: reconnect after %" PRIu32 " ms ....", WIFI_RECONECT_DELAY_MS);
+			ESP_LOGI(MANAGER_TAG, "MANAGER: reconnect after %" PRIu32 " ms ....", delay);
 			
 			if(wifi_should_reconnect(last_disconnect_reason))
 			{
-				if(reconnect_attempts > MAX_RECONNEKT_ATTEMPTS)
+				if(reconnect_attempts >= MAX_RECONNEKT_ATTEMPTS)
 				{
 					ESP_LOGW(MANAGER_TAG, "Maximum reconnect attempts reached :%" PRIu32 " from %" PRIu32, 
 					reconnect_attempts,
 					MAX_RECONNEKT_ATTEMPTS);
 					continue;
 				}
+				
 				ESP_LOGW(MANAGER_TAG, "Reconnect sheduled in %" PRIu32 " ms, next attempt=%" PRIu32 "/%" PRIu32, 
-				WIFI_RECONECT_DELAY_MS, 
+				delay, 
 				reconnect_attempts+1,
 				MAX_RECONNEKT_ATTEMPTS);
 				
-				vTaskDelay(pdMS_TO_TICKS(WIFI_RECONECT_DELAY_MS));
+				vTaskDelay(pdMS_TO_TICKS(delay));
 				// Start new connection attempt
 				wifi_manager_start_connection();
 			}
@@ -484,14 +524,11 @@ void app_main(void)
 	{
 		ESP_LOGE(TAG, "FAILED INIT WiFi !!! ");
 	}
-	ESP_LOGI(TAG, "WiFi STA initialized complited");
+	ESP_LOGI(TAG, "WiFi STA initialized complited"); 
 	
 	
 	
 	
-	
-	
-	
-	
+
 
 }
