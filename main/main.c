@@ -72,7 +72,7 @@ static const char *wifi_state_to_string(wifi_state_t state)
 			return "ONLINE";
 			
 		case WIFI_STATE_DISCONNECTED:
-			return "DISCONECTED";
+			return "DISCONNECTED";
 		
 		default:
 			return "UNKNOWN";
@@ -158,7 +158,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 					last_disconnect_reason = event->reason;
 				}
 					
-				ESP_LOGW(TAG, "EVENT: STA_CONNECTED reason :%u" , last_disconnect_reason);
+				ESP_LOGW(TAG, "EVENT: STA_DISCONNECTED reason :%u" , last_disconnect_reason);
 				wifi_manager_send_event(WIFI_MANAGER_EVENT_DISCONNECTED);
 				
 				break;
@@ -258,15 +258,6 @@ static void wifi_manager_task(void *parameters)
 			{
 				ESP_LOGW(MANAGER_TAG, "GOT_IP ignored in state=%s", wifi_state_to_string(wifi_state));
 			}
-			/*if((wifi_state == WIFI_STATE_CONNECTED) || (wifi_state == WIFI_STATE_CONNECTING))
-			{
-				wifi_manager_set_state(WIFI_STATE_ONLINE);
-				ESP_LOGI(MANAGER_TAG, "MANAGER: network is ONLINE");
-			}
-			else
-			{
-				ESP_LOGW(MANAGER_TAG, "GOT_IP ignored in state=%s", wifi_state_to_string(wifi_state));
-			}*/
 		}
 		
 		// DISCONNECTED
