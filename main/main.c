@@ -19,6 +19,7 @@
 #include "esp_wifi.h"
 #include "lwip/inet.h"
 
+
 typedef enum{
 	WIFI_STATE_INIT = 0,
 	WIFI_STATE_CONNECTING,
@@ -36,9 +37,12 @@ static wifi_state_t wifi_state = WIFI_STATE_INIT;
 #define WIFI_MANAGER_EVENT_DISCONNECTED 		(1UL << 3)
 #define WIFI_MANAGER_EVENT_ALL (WIFI_MANAGER_EVENT_START | WIFI_MANAGER_EVENT_CONNECTED | WIFI_MANAGER_EVENT_GOT_IP | WIFI_MANAGER_EVENT_DISCONNECTED)
 
-#define WIFI_RECONECT_DELAY_MS					2000U
+uint32_t  WIFI_RECONECT_DELAY_MS = 2000;
+uint32_t MAX_RECONNEKT_ATTEMPTS = 10;
 
-static uint8_t last_disconnect_reason = 0;
+static wifi_err_reason_t last_disconnect_reason = WIFI_REASON_UNSPECIFIED;
+static uint32_t reconnect_attempts = 0;
+
 
 
 static const char *TAG = "WIFI STA";
@@ -54,6 +58,47 @@ static TaskHandle_t wifi_manager_task_handle = NULL;
 #define WIFI_MANAGER_TASK_PRIORITY			5
 #define TEST_CORE							1
 
+
+
+
+static const char *wifi_disconnect_reason_to_string(wifi_err_reason_t reason)
+{
+	switch(reason)
+	{
+		case WIFI_REASON_AUTH_EXPIRE:	
+			return "AUTH_EXPIRE";
+			
+		case WIFI_REASON_AUTH_LEAVE:	
+			return "AUTH_LEAVE";
+			
+		case WIFI_REASON_ASSOC_EXPIRE:	
+			return "ASSOC_EXPIRE";			
+			
+		case WIFI_REASON_ASSOC_TOOMANY:	
+			return "ASSOC_TOOMANY";			
+			
+		case WIFI_REASON_NOT_AUTHED:	
+			return "NOT_AUTHED";			
+			
+		case WIFI_REASON_NOT_ASSOCED:	
+			return "NOT_ASSOCED";
+			
+		case WIFI_REASON_ASSOC_LEAVE:	
+			return "ASSOC_LEAVE";
+			
+		case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:	
+			return "4WAY_HANDSHAKE_TIMEOUT";
+			
+		case WIFI_REASON_BEACON_TIMEOUT:	
+			return "BEACON_TIMEOUT";
+			
+		case WIFI_REASON_NO_AP_FOUND:	
+			return "NO_AP_FOUND";			
+		
+		default:
+			return "UNKNOWN";
+	}
+}
 
 static const char *wifi_state_to_string(wifi_state_t state)
 {
@@ -76,6 +121,21 @@ static const char *wifi_state_to_string(wifi_state_t state)
 		
 		default:
 			return "UNKNOWN";
+	}
+}
+
+static bool wifi_should_reconnect(wifi_err_reason_t reason)
+{
+	switch(reason)	
+	{
+		case WIFI_REASON_BEACON_TIMEOUT:
+		case WIFI_REASON_NO_AP_FOUND:
+		case WIFI_REASON_AUTH_EXPIRE:
+		case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+			return true;
+			
+		default:
+			return true;
 	}
 }
 
@@ -112,6 +172,9 @@ static void wifi_manager_start_connection(void)
 		ESP_LOGW(TAG, "Already online, skip request");
 		return;
 	}
+	
+	reconnect_attempts++;
+	ESP_LOGI(TAG, "MANAGER: Startint WiFi connection, attempt :%lu", (unsigned long)reconnect_attempts);
 	wifi_manager_set_state(WIFI_STATE_CONNECTING);
 	
 	ESP_LOGI(TAG, "MANAGER: Starting WiFi connection ...");
@@ -156,6 +219,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 				if(event != NULL)
 				{
 					last_disconnect_reason = event->reason;
+					
+					ESP_LOGW(TAG, "STA_DISCONNECTED: reason=%d (%s)",
+					last_disconnect_reason,
+					wifi_disconnect_reason_to_string(last_disconnect_reason));
 				}
 					
 				ESP_LOGW(TAG, "EVENT: STA_DISCONNECTED reason :%u" , last_disconnect_reason);
@@ -253,6 +320,7 @@ static void wifi_manager_task(void *parameters)
 			{
 				wifi_manager_set_state(WIFI_STATE_ONLINE);
 				ESP_LOGI(MANAGER_TAG, "MANAGER: network is ONLINE");
+				reconnect_attempts = 0;
 			}
 			else
 			{
@@ -263,17 +331,35 @@ static void wifi_manager_task(void *parameters)
 		// DISCONNECTED
 		if(received_events & WIFI_MANAGER_EVENT_DISCONNECTED)
 		{
-			ESP_LOGW(MANAGER_TAG, "MANAGER: disconnet, reason %u", last_disconnect_reason);
+			ESP_LOGW(MANAGER_TAG, "MANAGER: disconnet, reason %u (%s)", last_disconnect_reason, wifi_disconnect_reason_to_string(last_disconnect_reason));
 			
 			wifi_manager_set_state(WIFI_STATE_DISCONNECTED);
 			
 			// For example, reconect after 2 seconds
-			ESP_LOGI(MANAGER_TAG, "MANAGER: reconnect after %u ms ....", WIFI_RECONECT_DELAY_MS);
+			ESP_LOGI(MANAGER_TAG, "MANAGER: reconnect after %" PRIu32 " ms ....", WIFI_RECONECT_DELAY_MS);
 			
-			vTaskDelay(pdMS_TO_TICKS(WIFI_RECONECT_DELAY_MS));
-			
-			// Start new connection attempt
-			wifi_manager_start_connection();
+			if(wifi_should_reconnect(last_disconnect_reason))
+			{
+				if(reconnect_attempts > MAX_RECONNEKT_ATTEMPTS)
+				{
+					ESP_LOGW(MANAGER_TAG, "Maximum reconnect attempts reached :%" PRIu32 " from %" PRIu32, 
+					reconnect_attempts,
+					MAX_RECONNEKT_ATTEMPTS);
+					continue;
+				}
+				ESP_LOGW(MANAGER_TAG, "Reconnect sheduled in %" PRIu32 " ms, next attempt=%" PRIu32 "/%" PRIu32, 
+				WIFI_RECONECT_DELAY_MS, 
+				reconnect_attempts+1,
+				MAX_RECONNEKT_ATTEMPTS);
+				
+				vTaskDelay(pdMS_TO_TICKS(WIFI_RECONECT_DELAY_MS));
+				// Start new connection attempt
+				wifi_manager_start_connection();
+			}
+			else
+			{
+				ESP_LOGW(MANAGER_TAG, "Reconnect disabled for reason=%u (%s)", last_disconnect_reason, wifi_disconnect_reason_to_string(last_disconnect_reason));
+			}
 		}
 	}
 }
