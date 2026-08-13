@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_wifi_types_generic.h"
+#include "esp_wifi_types.h"
 #include "nvs_flash.h"
 
 #include "esp_wifi.h"
@@ -20,11 +21,16 @@
 #include "lwip/inet.h"
 
 #include "esp_random.h"
+#include "esp_mac.h"
 
+
+static const char *TAG = "WIFI STA";
+static const char *MANAGER_TAG = "WIFI MANAGER TASK";
 
 typedef enum{
 	WIFI_STATE_INIT = 0,
 	WIFI_STATE_CONNECTING,
+	WIFI_STATE_SELECTING_AP,
 	WIFI_STATE_CONNECTED,
 	WIFI_STATE_ONLINE,
 	WIFI_STATE_DISCONNECTED	
@@ -37,6 +43,8 @@ static wifi_state_t wifi_state = WIFI_STATE_INIT;
 #define WIFI_MANAGER_EVENT_CONNECTED 			(1UL << 1)
 #define WIFI_MANAGER_EVENT_GOT_IP 				(1UL << 2)
 #define WIFI_MANAGER_EVENT_DISCONNECTED 		(1UL << 3)
+#define WIFI_MANAGER_EVENT_SCAN_DONE			(1UL << 4)
+#define WIFI_MANAGER_EVENT_SCAN_FAILED			(1UL << 5)
 #define WIFI_MANAGER_EVENT_ALL (WIFI_MANAGER_EVENT_START | WIFI_MANAGER_EVENT_CONNECTED | WIFI_MANAGER_EVENT_GOT_IP | WIFI_MANAGER_EVENT_DISCONNECTED)
 
 uint32_t WIFI_RECONECT_DELAY_MS = 2000U;
@@ -46,26 +54,263 @@ uint32_t WIFI_MAX_RECONNECT_DELAY_MS = 30000U;
 static wifi_err_reason_t last_disconnect_reason = WIFI_REASON_UNSPECIFIED;
 static uint32_t reconnect_attempts = 0;
 
-
-
-static const char *TAG = "WIFI STA";
-static const char *MANAGER_TAG = "WIFI MANAGER TASK";
-
-
 static esp_netif_t *wifi_sta_netif = NULL; 
+wifi_ap_record_t selected_ap;
+bool selected_ap_valid = false;
 
+
+static void wifi_manager_set_state(wifi_state_t new_state);
 static bool wifi_manager_send_event(uint32_t event_bit);
+
+
+
+
+
+static esp_err_t wifi_manager_select_beast_ap(void);
+
+
 
 static TaskHandle_t wifi_manager_task_handle = NULL;
 #define WIFI_MANAGER_TASK_SIZE				4096
 #define WIFI_MANAGER_TASK_PRIORITY			5
 #define TEST_CORE							1
 
+static esp_err_t wifi_manager_connect_selected_ap(void)
+{
+	if(selected_ap_valid == false)
+	{
+		ESP_LOGE(MANAGER_TAG, "AP not found");
+		return ESP_FAIL;
+	}
+	
+	wifi_config_t wifi_config = {0};
+	
+	strncpy((char*)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid)-1);
+	strncpy((char*)wifi_config.sta.password, WIFI_PASSWORD, sizeof(wifi_config.sta.password)-1);
+	
+	// Connect only to AP selected by scan algorithms
+	wifi_config.sta.bssid_set = true;
+	memcpy(wifi_config.sta.bssid, selected_ap.bssid, sizeof(wifi_config.sta.bssid));
+	
+	// Start searching from the chanel where selected AP was found
+	wifi_config.sta.channel = selected_ap.primary;
+	wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+	
+	ESP_LOGI(MANAGER_TAG, 
+		"Configure selected AP: SSID=%s, RSSI=%d, CH=%u BSSID= " MACSTR,
+		selected_ap.ssid,
+		selected_ap.rssi,
+		selected_ap.primary,
+		MAC2STR(selected_ap.bssid));
+	
+	esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+	if(err != ESP_OK)
+	{
+		ESP_LOGE(MANAGER_TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(err));
+		return err;
+	}
+	
+	reconnect_attempts++;
+	wifi_manager_set_state(WIFI_STATE_CONNECTING);
+	
+	ESP_LOGI(MANAGER_TAG, "Connecting to selected AP, attempt=%" PRIu32, reconnect_attempts);
+	
+	err= esp_wifi_connect();
+	if(err != ESP_OK)
+	{
+		ESP_LOGE(MANAGER_TAG, "Failed to connect to AP. err:%s", esp_err_to_name(err));
+		wifi_manager_set_state(WIFI_STATE_DISCONNECTED);
+		return err;
+	}
+	return ESP_OK;
+}
+
+static bool wifi_scan_and_select_ap(wifi_ap_record_t *selected_ap)
+{
+	static const char *TAG = "WIFI SCAN";
+	
+	ESP_LOGI(TAG, "Start WiFi scan...");
+	
+	wifi_scan_config_t scan_config = {
+		.ssid = NULL,
+		.bssid = NULL,
+		.channel = 0,
+		.show_hidden = true,
+		.scan_type = WIFI_SCAN_TYPE_ACTIVE,
+		.scan_time.active.min = 100,
+		.scan_time.active.max = 300,
+	};
+	
+	esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+	if(err != ESP_OK)
+	{
+		ESP_LOGE(TAG, "esp_wifi_scan_start failed: %s", esp_err_to_name(err));
+		return false;
+	}
+	
+	uint16_t ap_count = 0;
+	err = esp_wifi_scan_get_ap_num(&ap_count);
+	if(err != ESP_OK)
+	{
+		ESP_LOGE(TAG, "esp_wifi_scan_get_ap_num failed: %s", esp_err_to_name(err));
+		return false;
+	}
+
+	if(ap_count > 0)
+	{
+		ESP_LOGI(TAG, "Scan completed. Found APs: %u ", ap_count);	
+	}
+	else
+	{
+		ESP_LOGW(TAG, "No WiFi networks found");
+	}
+	
+	wifi_ap_record_t *ap_records = calloc(ap_count, sizeof(wifi_ap_record_t));
+	if(ap_records == NULL)
+	{
+		ESP_LOGE(TAG, "Failed to allocate memory");
+		return false;
+	}
+	
+	uint16_t records_to_get = ap_count;
+	err = esp_wifi_scan_get_ap_records(&records_to_get, ap_records);
+	if(err != ESP_OK)
+	{
+		ESP_LOGE(TAG, "esp_wifi_scan_get_ap_records Failed");
+		return false;
+	}
+	
+	// Show all faunded AP
+	for(uint16_t i = 0; i < records_to_get; i++)
+	{
+		ESP_LOGI(TAG, "[%u] SSID: %-32s | RSSI: %" PRId8" | CH: %u | BSSID: " MACSTR, 
+			i,
+			(char *)ap_records[i].ssid,
+			ap_records[i].rssi,
+			ap_records[i].primary,
+			MAC2STR(ap_records[i].bssid)
+		);
+	}
+	
+	bool found = false;
+	// Found target AP
+	for(uint16_t i = 0; i < records_to_get; i++)
+	{
+		if(ap_records[i].ssid[0] == '\0')		// Idnore AP witn hiden SSID
+		{
+			continue;
+		}
+		
+		if(strcmp((char *)ap_records[i].ssid, WIFI_SSID) != 0)		// Find target SSID
+		{
+			continue;
+		}
+		
+		if(found == false)
+		{
+			*selected_ap = ap_records[i];
+			found = true;
+			continue;
+		}
+		// If the same PAs have same SSID, select none witth the strongest RSSI
+		if(ap_records[i].rssi > selected_ap->rssi)
+		{
+			*selected_ap = ap_records[i];
+		}	
+	}
+	
+	free(ap_records);
+	
+	if(found == false)
+	{
+		ESP_LOGW(TAG, "Target AP SSID \"%s\" not found", WIFI_SSID);
+		return false;
+	}
+	
+	ESP_LOGI(TAG, "Selected AP:");
+	ESP_LOGI(TAG, " SSID : %s", selected_ap->ssid);
+	ESP_LOGI(TAG, " RSSI : %d dBm", selected_ap->rssi);
+	ESP_LOGI(TAG, " CH : %u", selected_ap->primary);
+	ESP_LOGI(TAG, " BSSID: " MACSTR, MAC2STR(selected_ap->bssid));
+	
+	return true;	
+}
+
+
+static esp_err_t wifi_manager_scan(void)
+{
+	static const char *TAG = "WIFI SCAN";
+	
+	ESP_LOGI(TAG, "Start WiFi scan...");
+	
+	wifi_scan_config_t scan_config = {
+		.ssid = NULL,
+		.bssid = NULL,
+		.channel = 0,
+		.show_hidden = true,
+		.scan_type = WIFI_SCAN_TYPE_ACTIVE,
+		.scan_time.active.min = 100,
+		.scan_time.active.max = 300,
+	};
+	
+	esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+	if(err != ESP_OK)
+	{
+		ESP_LOGE(TAG, "esp_wifi_scan_start failed: %s", esp_err_to_name(err));
+		return err;
+	}
+	
+	uint16_t ap_count = 0;
+	err = esp_wifi_scan_get_ap_num(&ap_count);
+	if(err != ESP_OK)
+	{
+		ESP_LOGE(TAG, "esp_wifi_scan_get_ap_num failed: %s", esp_err_to_name(err));
+		return err;
+	}
+
+	if(ap_count > 0)
+	{
+		ESP_LOGI(TAG, "Scan completed. Found APs: %u ", ap_count);	
+	}
+	else
+	{
+		ESP_LOGW(TAG, "No WiFi networks found");
+	}
+	
+	wifi_ap_record_t *ap_records = calloc(ap_count, sizeof(wifi_ap_record_t));
+	if(ap_records == NULL)
+	{
+		ESP_LOGE(TAG, "Failed to allocate memory");
+		return ESP_ERR_NO_MEM;
+	}
+	
+	uint16_t records_to_get = ap_count;
+	err = esp_wifi_scan_get_ap_records(&records_to_get, ap_records);
+	if(ap_records == NULL)
+	{
+		ESP_LOGE(TAG, "esp_wifi_scan_get_ap_records Failed");
+		return ESP_ERR_NO_MEM;
+	}
+	
+	// Show all faunded AP
+	for(uint16_t i = 0; i < records_to_get; i++)
+	{
+		ESP_LOGI(TAG, "[%u] SSID: %-32s | RSSI: %" PRId8" | CH: %u | BSSID: " MACSTR, 
+			i,
+			(char *)ap_records[i].ssid,
+			ap_records[i].rssi,
+			ap_records[i].primary,
+			MAC2STR(ap_records[i].bssid)
+		);
+	}
+
+	free(ap_records);
+	return true;	
+}
+
 static uint32_t wifi_get_jitter(uint32_t max_jitter)
 {
 	return esp_random()%(max_jitter + 1);
-
-	
 }
 
 static uint32_t wifi_get_backoff_delay(uint32_t attempt)
@@ -145,6 +390,9 @@ static const char *wifi_state_to_string(wifi_state_t state)
 			
 		case WIFI_STATE_CONNECTING:
 			return "CONNECTING";
+			
+		case WIFI_STATE_SELECTING_AP:
+			return "SELECTING_AP";
 			
 		case WIFI_STATE_CONNECTED:
 			return "CONNECTED";
@@ -315,18 +563,39 @@ static void wifi_manager_task(void *parameters)
 		// START
 		if(received_events & WIFI_MANAGER_EVENT_START)
 		{
-			ESP_LOGI(MANAGER_TAG, "MANAGER: start event");
-			
-			// Initial connection
 			if((wifi_state == WIFI_STATE_INIT) || (wifi_state == WIFI_STATE_DISCONNECTED))
 			{
-				wifi_manager_start_connection();
+				ESP_LOGI(MANAGER_TAG, "MANAGER: start event");
+				
+				wifi_manager_set_state(WIFI_STATE_SELECTING_AP);
+				
+				selected_ap_valid = false;
+			
+				if(wifi_scan_and_select_ap(&selected_ap) == true)	// Fount target AP
+				{
+					selected_ap_valid = true;
+					ESP_LOGI(TAG, "AP selection successful");
+					
+					esp_err_t err = wifi_manager_connect_selected_ap();
+					if(err != ESP_OK)
+					{
+						ESP_LOGE(MANAGER_TAG, "Connected to selected AP failed. err: %s", esp_err_to_name(err));
+						wifi_manager_set_state(WIFI_STATE_DISCONNECTED);
+					}
+				}
+				else
+				{
+					// selected_ap_valid = false;
+					ESP_LOGW(TAG, "Selection AP failed");
+				}
 			}
 			else
 			{
-				ESP_LOGW(MANAGER_TAG, "START ignored in state=%s", wifi_state_to_string(wifi_state));
+				ESP_LOGW(TAG, "Start ignored in state =%s", wifi_state_to_string(wifi_state));
 			}
+			
 		}
+		
 		
 		// CONNECTED
 		if(received_events & WIFI_MANAGER_EVENT_CONNECTED)
@@ -339,7 +608,7 @@ static void wifi_manager_task(void *parameters)
 			{
 				wifi_manager_set_state(WIFI_STATE_CONNECTED);
 			}		
-			else
+			else 
 			{
 				ESP_LOGW(MANAGER_TAG, "CONNECTED ignored in state=%s", wifi_state_to_string(wifi_state));
 			}
@@ -461,28 +730,12 @@ static esp_err_t wifi_init(void)
 		return err;
 	}
 	
-	// Configure STA mode
-	wifi_config_t wifi_config = {0};
-	
-	strncpy((char*)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
-	strncpy((char*)wifi_config.sta.password, WIFI_PASSWORD, sizeof(wifi_config.sta.password) - 1);
-	
-	// Use normal station mode
-	wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-	
 	err = esp_wifi_set_mode(WIFI_MODE_STA);
 	if(err != ESP_OK)
 	{
 		ESP_LOGE(TAG, "esp_wifi_set_mode failed. err: %s", esp_err_to_name(err));
 	}
-	
-	
-	err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-	if(err != ESP_OK)
-	{
-		ESP_LOGE(TAG, "esp_wifi_set_config failed. err: %s", esp_err_to_name(err));
-	}
-	
+
 	
 	// Create manager task
 	esp_err_t status = xTaskCreatePinnedToCore(wifi_manager_task, "wifi_manager_task", WIFI_MANAGER_TASK_SIZE, NULL, WIFI_MANAGER_TASK_PRIORITY, &wifi_manager_task_handle, TEST_CORE);
