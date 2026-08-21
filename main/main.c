@@ -51,40 +51,50 @@ typedef enum {
 	WIFI_MANAGER_CMD_RECONNECT
 }wifi_manager_message_id_t;
 
+// Queue structure
 typedef struct{
 	wifi_manager_message_id_t id;
 	wifi_err_reason_t disconnect_reason;
 }wifi_manager_message_t;
 
-
+// Sate mashine state
 static wifi_state_t wifi_state = WIFI_STATE_INIT;
-
 
 uint32_t WIFI_RECONECT_DELAY_MS = 2000U;
 uint32_t MAX_RECONNEKT_ATTEMPTS = 15U;
 uint32_t WIFI_MAX_RECONNECT_DELAY_MS = 30000U;
 
-static uint32_t reconnect_attempts = 1;
+static uint32_t reconnect_attempts = 0;				// General reconnect counter
+
+// Reconect to seme AP
+#define WIFI_SAME_AP_RECONNECT_LIMIT 		2U
+static uint32_t same_ap_reconnect_attempts = 0;
 
 static esp_netif_t *wifi_sta_netif = NULL; 
-wifi_ap_record_t selected_ap;
+wifi_ap_record_t selected_ap;					
 
-bool selected_ap_valid = false;
-static bool auto_reconnect_anabled = true; 			
+bool selected_ap_valid = false;							// False if PA don't was found
+static bool auto_reconnect_anabled = true; 			 
 
+// Для визначення для від кого прийшла коменда на RECONNECT
 typedef enum{
 	WIFI_SCAN_PURPOSE_NONE = 0,
-	WIFI_SCAN_PURPOSE_CONNECT,
-	WIFI_SCAN_PURPOSE_USER
+	WIFI_SCAN_PURPOSE_CONNECT,			// Якщо ESP32 сам переключається через втрату звязку за AP
+	WIFI_SCAN_PURPOSE_USER				// Якщо USER сам перемикає
 } wifi_scan_purpose_t;
-
 static wifi_scan_purpose_t wifi_scan_purpose =  WIFI_SCAN_PURPOSE_NONE;
+
+// Описує методи відновлення підключення до AP
+typedef enum{
+	WIFI_RECOVERY_ACTION_NONE = 0,
+	WIFI_RECOVERY_ACTION_DIRECT_RECONNECT,
+	WIFI_RECOVERY_ACTION_RESCAN,
+	WIFI_RECOVERY_ACTION_STOP
+}wifi_recovery_action_t;
+static wifi_recovery_action_t pending_recovery_action = WIFI_RECOVERY_ACTION_NONE;
 
 static void wifi_manager_set_state(wifi_state_t new_state);
 static bool wifi_manager_send_message(wifi_manager_message_t *message);
-
-static TimerHandle_t wifi_reconnect_timmer = NULL;
-
 
 static TaskHandle_t wifi_manager_task_handle = NULL;
 #define WIFI_MANAGER_TASK_SIZE				4096
@@ -94,6 +104,7 @@ static TaskHandle_t wifi_manager_task_handle = NULL;
 static QueueHandle_t wifi_manager_queue = NULL;
 #define WIFI_MANAGER_QUEUE_LENGTH 			10
 
+static TimerHandle_t wifi_reconnect_timmer = NULL;
 
 static const char *wifi_disconnect_reason_to_string(wifi_err_reason_t reason)
 {
@@ -168,7 +179,7 @@ static const char *wifi_state_to_string(wifi_state_t state)
 }
 
 
-// Сканує AP і в залежності від purpose просто виводить список просканованих AP або вибирає TARGET AP мережу
+// Сканує AP і в залежності від purpose просто сканує і виводить список просканованих AP або сканує івибирає TARGET AP мережу
 // і записує її в глобальну змінну selected_ap
 static esp_err_t wifi_manager_process_scan_results(wifi_scan_purpose_t purpose)
 {
@@ -218,6 +229,7 @@ static esp_err_t wifi_manager_process_scan_results(wifi_scan_purpose_t purpose)
 	}	
 	
 	// Якщо команда на сканування була від user тоді не підключатись на знайденої AP
+	// Тобто функція просто скнанує всі вдоступні AP
 	if(purpose == WIFI_SCAN_PURPOSE_USER)		
 	{
 		free(ap_records);
@@ -228,18 +240,18 @@ static esp_err_t wifi_manager_process_scan_results(wifi_scan_purpose_t purpose)
 	bool found = false;
 	for(uint16_t i = 0; i < record_to_ger; i++)
 	{
-		if(ap_records[i].ssid[0] == '\0')
+		if(ap_records[i].ssid[0] == '\0')						// Ігнорувати PA з прихованим SSID		
 		{
 			continue;
 		}
-		if(strcmp((char*)ap_records[i].ssid, WIFI_SSID) != 0)  // Found AP SSID != target AP
+		if(strcmp((char*)ap_records[i].ssid, WIFI_SSID) != 0)  	// Ігнорувати не потрібні AP
 		{
 			continue;
 		}
 		
 		if(found == false)	
 		{
-			selected_ap = ap_records[i];
+			selected_ap = ap_records[i];						// Зберегти в глобальну змінну
 			found = true;
 			continue;
 		}
@@ -258,7 +270,7 @@ static esp_err_t wifi_manager_process_scan_results(wifi_scan_purpose_t purpose)
 		return ESP_FAIL;
 	}
 	
-	selected_ap_valid = true;
+	selected_ap_valid = true;		// Виставити флаг, що потрібна AP знайдена
 	
 	ESP_LOGI(TAG, "Selected AP:");
 	ESP_LOGI(TAG, " SSID ; %s", (char*)selected_ap.ssid);
@@ -269,6 +281,68 @@ static esp_err_t wifi_manager_process_scan_results(wifi_scan_purpose_t purpose)
 	return ESP_OK;
 }
 
+
+// Scan APs with non block mode(When scan will done WIFI_EVENT_SCAN_DONE event wil be genereted in wifi_event_handler)
+static esp_err_t wifi_manager_start_scan(wifi_scan_purpose_t purpose)   
+{
+	if(purpose == WIFI_SCAN_PURPOSE_NONE)				//  Запустити скан з реальною причиною
+	{
+		return ESP_ERR_INVALID_ARG;	
+	}
+	// wifi_scan_purpose - глобальний поточний стан сканування
+	if(wifi_scan_purpose != WIFI_SCAN_PURPOSE_NONE)		// чи не виконується зараз скан
+	{
+		ESP_LOGW(MANAGER_TAG, "Scan already in progress");
+		return ESP_ERR_INVALID_STATE;
+	}
+	
+	wifi_scan_config_t scan_config = {
+		.ssid = NULL,
+		.bssid = NULL,
+		.channel = 0,
+		.show_hidden = true,
+		.scan_type = WIFI_SCAN_TYPE_ACTIVE,
+		.scan_time.active.min = 100,
+		.scan_time.active.max = 300
+	};
+	
+	wifi_scan_purpose = purpose;			// Встановити глобальний статув "Від кого було викликано сканування"
+	
+	ESP_LOGI(MANAGER_TAG, "Starting asinchronous WiFi scan");
+	esp_err_t err = esp_wifi_scan_start(&scan_config, false);		// Сканує всі найблищі AP в свою память
+	if(err != ESP_OK)
+	{
+		ESP_LOGE(MANAGER_TAG, "esp_wifi_scan_start failed %s", esp_err_to_name(err));
+		wifi_scan_purpose = WIFI_SCAN_PURPOSE_NONE;
+		return err;
+	}
+	return ESP_OK;
+}
+// Запускає загальний процес асинхронного сканування і підключення до AP
+static bool wifi_manager_start_ap_selection(void)
+{
+	// якщо wifi_state не WIFI_STATE_INIT і не WIFI_STATE_DISCONNECTED
+	if((wifi_state != WIFI_STATE_INIT) && (wifi_state != WIFI_STATE_DISCONNECTED))
+	{
+		ESP_LOGW(MANAGER_TAG, "Connect sequence ignored in stste %s",  wifi_state_to_string(wifi_state));	
+		return false;
+	}
+						
+	wifi_manager_set_state(WIFI_STATE_SELECTING_AP);
+						
+	selected_ap_valid = false;
+	
+	// Scan networks and select target AP	
+	esp_err_t err = wifi_manager_start_scan(WIFI_SCAN_PURPOSE_CONNECT);
+	if(err != ESP_OK)
+	{
+		ESP_LOGE(MANAGER_TAG, "Connected to selected AP failed. err: %s", esp_err_to_name(err));
+		wifi_manager_set_state(WIFI_STATE_DISCONNECTED);
+		return false;
+	}
+	return true;
+}
+// Підключитися до визначеної AP з відомим SSID i Password
 static esp_err_t wifi_manager_connect_selected_ap(void)
 {
 	if(selected_ap_valid == false)
@@ -304,6 +378,7 @@ static esp_err_t wifi_manager_connect_selected_ap(void)
 		return err;
 	}
 	
+	same_ap_reconnect_attempts = 0;
 	reconnect_attempts++;
 	wifi_manager_set_state(WIFI_STATE_CONNECTING);
 	
@@ -319,6 +394,15 @@ static esp_err_t wifi_manager_connect_selected_ap(void)
 	return ESP_OK;
 }
 
+
+////////////////////////////////////////  API FUNCTIONS /////////////////////////////////////////////
+/* Ці функції зроблені для того щоб можна було керувати WiFi ззовні
+wifi_manager_scan
+wifi_manager_connect
+wifi_manager_disconnect
+wifi_manager_get_state
+wifi_manager_is_online
+*/ 
 wifi_state_t wifi_manager_get_state(void)
 {
 	return wifi_state;
@@ -337,80 +421,6 @@ bool wifi_manager_scan(void)
 	return wifi_manager_send_message(&message);
 }
 
-// Scan APs without block mode(When scan will done WIFI_EVENT_SCAN_DONE event wil be genereted in wifi_event_handler)
-static esp_err_t wifi_manager_start_scan(wifi_scan_purpose_t purpose)   
-{
-	if(purpose == WIFI_SCAN_PURPOSE_NONE)		//  Запустити скан з реальною причиною
-	{
-		return ESP_ERR_INVALID_ARG;	
-	}
-	// wifi_scan_purpose - глобальний поточний стан сканування
-	if(wifi_scan_purpose != WIFI_SCAN_PURPOSE_NONE)		// чи не виконується зараз скан
-	{
-		ESP_LOGW(MANAGER_TAG, "Scan already in progress");
-		return ESP_ERR_INVALID_STATE;
-	}
-	
-	wifi_scan_config_t scan_config = {
-		.ssid = NULL,
-		.bssid = NULL,
-		.channel = 0,
-		.show_hidden = true,
-		.scan_type = WIFI_SCAN_TYPE_ACTIVE,
-		.scan_time.active.min = 100,
-		.scan_time.active.max = 300
-	};
-	
-	wifi_scan_purpose = purpose;
-	
-	ESP_LOGI(MANAGER_TAG, "Starting asinchronous WiFi scan");
-	esp_err_t err = esp_wifi_scan_start(&scan_config, false);
-	if(err != ESP_OK)
-	{
-		ESP_LOGE(MANAGER_TAG, "esp_wifi_scan_start failed %s", esp_err_to_name(err));
-		wifi_scan_purpose = WIFI_SCAN_PURPOSE_NONE;
-		return err;
-	}
-	return ESP_OK;
-}
-
-static bool wifi_manager_shedule_reconnect(uint32_t delay_ms)
-{
-	if(wifi_reconnect_timmer == NULL)
-	{
-		ESP_LOGE(TAG, "wifi_reconnect_timmer == NULL");
-		return false;
-	}
-	
-	TickType_t delay_ticks = pdMS_TO_TICKS(delay_ms);
-	if(delay_ticks == 0)
-	{
-		delay_ticks = 1;
-	}
-	
-	BaseType_t status = xTimerChangePeriod(wifi_reconnect_timmer, delay_ticks, 0 );
-	if(status != pdPASS)
-	{
-		ESP_LOGE(TAG, "xTimerChangePeriod failed");
-		return false;
-	}
-	return true;
-}
-
-static void wifi_reconnect_timer_callback(TimerHandle_t timer)
-{
-	(void)timer;
-	
-	wifi_manager_message_t message = {
-		.id = WIFI_MANAGER_CMD_RECONNECT
-	};
-	
-	if(wifi_manager_send_message(&message) == false)
-	{
-		ESP_LOGW(MANAGER_TAG, "Failed send rRECONNECT command from timmer");
-	}
-}
-
 bool wifi_manager_disconnect(void)
 {
 	wifi_manager_message_t message = {
@@ -426,30 +436,49 @@ bool wifi_manager_connect(void)
 	};
 	return wifi_manager_send_message(&message);
 }
-static bool wifi_manager_start_connect_sequance(void)
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// Налаштовує і вмикає таймер наспрацювання на певний період.
+static bool wifi_manager_shedule_reconnect(uint32_t delay_ms)
 {
-	// якщо wifi_state не WIFI_STATE_INIT і не WIFI_STATE_DISCONNECTED
-	if((wifi_state != WIFI_STATE_INIT) && (wifi_state != WIFI_STATE_DISCONNECTED))
+	if(wifi_reconnect_timmer == NULL)	// Чи був таймер ініціалізований
 	{
-		ESP_LOGW(MANAGER_TAG, "Connect sequence ignored in stste %s",  wifi_state_to_string(wifi_state));	
+		ESP_LOGE(TAG, "wifi_reconnect_timmer == NULL");
 		return false;
 	}
-						
-	wifi_manager_set_state(WIFI_STATE_SELECTING_AP);
-						
-	selected_ap_valid = false;
 	
-	// Scan networks and select target AP	
-	esp_err_t err = wifi_manager_start_scan(WIFI_SCAN_PURPOSE_CONNECT);
-	if(err != ESP_OK)
+	TickType_t delay_ticks = pdMS_TO_TICKS(delay_ms);
+	if(delay_ticks == 0)
 	{
-		ESP_LOGE(MANAGER_TAG, "Connected to selected AP failed. err: %s", esp_err_to_name(err));
-		wifi_manager_set_state(WIFI_STATE_DISCONNECTED);
+		delay_ticks = 1;
+	}
+	
+	BaseType_t status = xTimerChangePeriod(wifi_reconnect_timmer, delay_ticks, 0 );  // Set period and run Timer
+	if(status != pdPASS)
+	{
+		ESP_LOGE(TAG, "xTimerChangePeriod failed");
 		return false;
 	}
 	return true;
 }
+// Колбек запускає WIFI_MANAGER_CMD_RECONNECT процедуру для перепідключення.
+static void wifi_reconnect_timer_callback(TimerHandle_t timer)
+{
+	(void)timer;
+	
+	wifi_manager_message_t message = {
+		.id = WIFI_MANAGER_CMD_RECONNECT
+	};
+	
+	if(wifi_manager_send_message(&message) == false)
+	{
+		ESP_LOGW(MANAGER_TAG, "Failed send rRECONNECT command from timmer");
+	}
+}
 
+
+// Записує вхідні дані в Queue і відсилає до wifi_manager_task
 static bool wifi_manager_send_message(wifi_manager_message_t *message)
 {
 	if(message == NULL)
@@ -472,11 +501,19 @@ static bool wifi_manager_send_message(wifi_manager_message_t *message)
 	return true;
 }
 
-
+// Generet gandom part, for ctreate unicume part of tame reconnect
 static uint32_t wifi_get_jitter(uint32_t max_jitter)
 {
 	return esp_random()%(max_jitter + 1);
 }
+/* Generate "dalay" depend "attempt" 
+attempt    dalay
+0			2s
+1			4s
+3			8s
+4			16s
+5			30s
+*/ 
 
 static uint32_t wifi_get_backoff_delay(uint32_t attempt)
 {
@@ -497,32 +534,85 @@ static uint32_t wifi_get_backoff_delay(uint32_t attempt)
 	
 	return delay;
 }
+// Create unic random time for reconnect.
 static uint32_t wifi_get_retry_delay(uint32_t attempt)
 {
 	uint32_t backoff = wifi_get_backoff_delay(attempt);
 	uint32_t jitter = wifi_get_jitter(500);
-	
 	//ESP_LOGI("TEST RANDOM ","backoff :%" PRIu32 " ms" "jitter :%" PRIu32 "ms" , backoff, jitter);
-	
 	return backoff + jitter;
 }
 
-
-static bool wifi_should_reconnect(wifi_err_reason_t reason)
+/* Отримує причину відключення, в залежності від причини відключення 
+вертає дію яку потрібно зробити після цього відключення відповідно до enum wifi_recovery_action_t
+*/ 
+static wifi_recovery_action_t wifi_get_recowery_acrion(wifi_err_reason_t reason)
 {
-	switch(reason)	
+	switch(reason)
 	{
+		// AP був доступний, але звязок з ним пропав
+		// Спочатку є сенс спробувати старий BSSID
 		case WIFI_REASON_BEACON_TIMEOUT:
+			return WIFI_RECOVERY_ACTION_DIRECT_RECONNECT;
+			
+		// Driver не знаходить AP 
+		// Немає сенсу повторювати той самий BSSID
 		case WIFI_REASON_NO_AP_FOUND:
+			return WIFI_RECOVERY_ACTION_RESCAN;
+			
+		// Тимчасові connection failues.
+		// Дозволино кілька direct retries, після чого робиться повний rescan
+		case WIFI_REASON_TIMEOUT:
+		case WIFI_REASON_CONNECTION_FAIL:
 		case WIFI_REASON_AUTH_EXPIRE:
 		case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
-			return true;
 			
+			if(same_ap_reconnect_attempts >= WIFI_SAME_AP_RECONNECT_LIMIT)
+			{
+				return WIFI_RECOVERY_ACTION_RESCAN;
+			}
+			return WIFI_RECOVERY_ACTION_DIRECT_RECONNECT;
+		
+		// для Internal disconnect recovery не потрібний 
+		case WIFI_REASON_ASSOC_LEAVE:
+			return WIFI_RECOVERY_ACTION_STOP;
+			
+		//Для невідомої transient problem
 		default:
-			return true;
+			if(same_ap_reconnect_attempts >= WIFI_SAME_AP_RECONNECT_LIMIT)
+			{
+				return WIFI_RECOVERY_ACTION_RESCAN;
+			}	
+			return WIFI_RECOVERY_ACTION_DIRECT_RECONNECT;
 	}
 }
 
+// Формування затримки для підключення до AP. Затримка генерується залежно від reconnect_attempts.
+static bool wifi_manager_scedule_recovery(wifi_recovery_action_t action)
+{
+	if((action == WIFI_RECOVERY_ACTION_NONE) || (action == WIFI_RECOVERY_ACTION_STOP))
+	{
+		return false;
+	}
+	
+	pending_recovery_action = action;
+	uint32_t delay;
+	
+	// Вирахувати delay для наступного підключення до AP 
+	if(reconnect_attempts >= MAX_RECONNEKT_ATTEMPTS)	// Якщо перевищено кількісь піддключень
+	{
+		delay = WIFI_MAX_RECONNECT_DELAY_MS + wifi_get_jitter(500);
+		ESP_LOGW(MANAGER_TAG, "Enter long-term recovery. Next recovery in %" PRIu32" ms", delay);
+	}
+	else  // генерувати стандартну послідовність 2,4,8,16,30 
+	{
+		delay = wifi_get_retry_delay(reconnect_attempts + 1);
+		ESP_LOGI(MANAGER_TAG, "Recovery sheduler in %" PRIu32 " ms", delay);
+	}
+	return wifi_manager_shedule_reconnect(delay);			// Запустити таймер на підключення до AP
+}
+
+// Зберігає стан State Mashine в глобальну змінну
 static void wifi_manager_set_state(wifi_state_t new_state)
 {
 	if(wifi_state == new_state)   // if no changing
@@ -533,8 +623,8 @@ static void wifi_manager_set_state(wifi_state_t new_state)
 	wifi_state = new_state;
 }
 
-
-static void wifi_manager_start_connection(void)
+// Повторно пробує підключається до мережі, до якої було підключення і зникло за певних причин
+static void wifi_manager_reconnect_to_current_ap(void)
 {
 	if(wifi_state == WIFI_STATE_CONNECTING)
 	{
@@ -547,8 +637,11 @@ static void wifi_manager_start_connection(void)
 		return;
 	}
 	
-	reconnect_attempts++;
-	ESP_LOGI(TAG, "MANAGER: Startint WiFi connection, attempt :%lu", (unsigned long)reconnect_attempts);
+	reconnect_attempts++;					
+	same_ap_reconnect_attempts++;
+	
+	ESP_LOGI(TAG, "MANAGER: Startint WiFi connection, attempt :%lu same pa attemprs :%lu", 
+		(unsigned long)reconnect_attempts, (unsigned long)same_ap_reconnect_attempts);
 	wifi_manager_set_state(WIFI_STATE_CONNECTING);
 	
 	ESP_LOGI(TAG, "MANAGER: Starting WiFi connection ...");
@@ -558,6 +651,16 @@ static void wifi_manager_start_connection(void)
 	{
 		ESP_LOGE(TAG, "MANAGER: reconnect FAILED err: %s", esp_err_to_name(err));
 		wifi_manager_set_state(WIFI_STATE_DISCONNECTED);
+		
+		selected_ap_valid = false;
+		
+		if(auto_reconnect_anabled)
+		{
+			if(wifi_manager_scedule_recovery(WIFI_RECOVERY_ACTION_RESCAN) == false)
+			{
+				ESP_LOGE(TAG, "Failed to shedule recowery");
+			}
+		}
 	}	
 }
 
@@ -606,10 +709,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 				
 				if(event != NULL)
 				{
-					message.disconnect_reason = event->reason;
+					message.disconnect_reason = event->reason;		// Save reason of disconnect
 					
 					ESP_LOGW(TAG, "STA_DISCONNECTED: reason=%d (%s)",
-						event->reason,
+						message.disconnect_reason,
 						wifi_disconnect_reason_to_string(event->reason));
 				}
 					
@@ -659,21 +762,18 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 	}
 }
 
-
-
 static void wifi_manager_task(void *parameters)
 {
 	(void)parameters;
 
 	wifi_manager_message_t message;
-	
 	wifi_err_reason_t last_disconnect_reason = 0;
  
-	
 	ESP_LOGI(TAG, "Manager task started");
 	
 	for(;;)
 	{ 
+		// Waiting on the Queue from wifi_event_handler
 		BaseType_t status = xQueueReceive(wifi_manager_queue ,&message, portMAX_DELAY);
 		if(status != pdPASS)
 		{
@@ -693,11 +793,10 @@ static void wifi_manager_task(void *parameters)
 					auto_reconnect_anabled = true;
 					reconnect_attempts = 0;
 					
-					wifi_manager_start_connect_sequance();
+					wifi_manager_start_ap_selection();		// Start scann and connect process
 				}
 				else
 				{
-					// selected_ap_valid = false;
 					ESP_LOGW(TAG, "STA_Start ignoreg in state %s", wifi_state_to_string(wifi_state));
 				}
 				break;	
@@ -728,42 +827,51 @@ static void wifi_manager_task(void *parameters)
 			
 				wifi_manager_set_state(WIFI_STATE_DISCONNECTED);
 				
-				// Cteate delay depent of attempt. 2,4,8,16,30, 30, 30 seconda + random part from 0 to 500 mSec
-				uint32_t delay = wifi_get_retry_delay(reconnect_attempts);
-				
+				// Manual connect
 				if(auto_reconnect_anabled == false)
 				{
-					ESP_LOGI(MANAGER_TAG, "Auto reconnect disabled. Stay disconnect.");
+					pending_recovery_action = WIFI_RECOVERY_ACTION_NONE;
+					ESP_LOGI(MANAGER_TAG,"Autoreconnect disabled. Stay disconnected");
 					break;
 				}
 				
-				// For example, reconect after 2 seconds
-				ESP_LOGI(MANAGER_TAG, "MANAGER: reconnect after %" PRIu32 " ms ....", delay);
+				// Вибрати recowery strategy на основі причини disconnect
+				wifi_recovery_action_t action = wifi_get_recowery_acrion(last_disconnect_reason);
 				
-				if(wifi_should_reconnect(last_disconnect_reason))
+				// Якщо driver каже, що AP більше не знайдений, попередній selected AP вважати stale.(несвіжим)
+				if(last_disconnect_reason == WIFI_REASON_NO_AP_FOUND)
 				{
-					if(reconnect_attempts >= MAX_RECONNEKT_ATTEMPTS)
-					{
-						ESP_LOGW(MANAGER_TAG, "Maximum reconnect attempts reached :%" PRIu32 " from %" PRIu32, 
-							reconnect_attempts,
-							MAX_RECONNEKT_ATTEMPTS);
-						continue;
-					}
-					
-					ESP_LOGW(MANAGER_TAG, "Reconnect sheduled in %" PRIu32 " ms, next attempt=%" PRIu32 "/%" PRIu32, 
-						delay, 
-						reconnect_attempts+1,
-						MAX_RECONNEKT_ATTEMPTS);
-					
-					if(wifi_manager_shedule_reconnect(delay) == false)
-					{
-						ESP_LOGE(MANAGER_TAG, "Failed to shedule reconnect");
-					}
+					selected_ap_valid = false;
 				}
-				else
+				
+				if(action == WIFI_RECOVERY_ACTION_STOP)
 				{
-					ESP_LOGW(MANAGER_TAG, "Reconnect disabled for reason=%u (%s)", last_disconnect_reason, wifi_disconnect_reason_to_string(last_disconnect_reason));
+					pending_recovery_action = WIFI_RECOVERY_ACTION_NONE;
+					ESP_LOGW(MANAGER_TAG, "Recowery stopped for reason =%s", wifi_disconnect_reason_to_string(last_disconnect_reason));
+					break;
 				}
+				
+				// Defensive chack:
+				// direct reconnect неможливий без valid AP
+				if((action == WIFI_RECOVERY_ACTION_DIRECT_RECONNECT) && (selected_ap_valid == false))
+				{
+					action = WIFI_RECOVERY_ACTION_RESCAN;
+				}
+				
+				if(action == WIFI_RECOVERY_ACTION_DIRECT_RECONNECT)
+				{
+					ESP_LOGI(MANAGER_TAG, "Recovery strategy: DIRECT_RECONNECT");
+				}
+				else if(action == WIFI_RECOVERY_ACTION_RESCAN)
+				{
+					ESP_LOGI(MANAGER_TAG, "Recovery strategy: RESCAN");
+				}
+				
+				if(wifi_manager_scedule_recovery(action) == false)
+				{
+					ESP_LOGE(MANAGER_TAG, "Failed to chedule recovery");
+				}
+				
 				break;
 			}
 			
@@ -776,7 +884,10 @@ static void wifi_manager_task(void *parameters)
 				{
 					wifi_manager_set_state(WIFI_STATE_ONLINE);
 					ESP_LOGI(MANAGER_TAG, "MANAGER: network is ONLINE");
-					reconnect_attempts = 1;
+					
+					reconnect_attempts = 0;
+					same_ap_reconnect_attempts = 0;
+					pending_recovery_action = WIFI_RECOVERY_ACTION_NONE;
 				}
 				else
 				{
@@ -789,20 +900,19 @@ static void wifi_manager_task(void *parameters)
 			{
 				ESP_LOGI(MANAGER_TAG, "MANAGER: WIFI_MANAGER_MSG_SCAN_DONE event");
 				
-				// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-				
 				wifi_scan_purpose_t complected_scan = wifi_scan_purpose;
 				wifi_scan_purpose = WIFI_SCAN_PURPOSE_NONE;
 				
 				if(complected_scan == WIFI_SCAN_PURPOSE_NONE)
 				{
-					ESP_LOGW(MANAGER_TAG, "Unexpectec SCAN_DONE ignored");
+					ESP_LOGW(MANAGER_TAG, "Unexpected SCAN_DONE ignored");
 					break;
 				}
 				
+				// Показати або підключитись до знайденого AP
 				esp_err_t err = wifi_manager_process_scan_results(complected_scan);
 				
-				// User requested scan		
+				// User requested scan	(Scan command from API)
 				if(complected_scan == WIFI_SCAN_PURPOSE_USER)
 				{
 					ESP_LOGW(MANAGER_TAG, "Don't connect, only print AP list");
@@ -816,27 +926,66 @@ static void wifi_manager_task(void *parameters)
 				// Scan was part of CONNECT sequence
 				if(complected_scan == WIFI_SCAN_PURPOSE_CONNECT)
 				{		
-					if(err != ESP_OK)
+					if(err != ESP_OK)  // Якщо не було знайдено target AP
 					{
 						ESP_LOGW(MANAGER_TAG, "Target AP not found");
 						
 						wifi_manager_set_state(WIFI_STATE_DISCONNECTED);
+						
+						if(auto_reconnect_anabled == false)
+						{
+							ESP_LOGI(MANAGER_TAG, "Auto recovery disabled");
+							break;
+						}
+						
+						if(reconnect_attempts < MAX_RECONNEKT_ATTEMPTS)
+						{
+							reconnect_attempts++;
+						}
+						if(wifi_manager_scedule_recovery(WIFI_RECOVERY_ACTION_RESCAN) == false)
+						{
+							ESP_LOGE(MANAGER_TAG, "Failed to shedule RESCAN recovery");
+						}
 						break;
 					}
 					
+					// Сканування пройшло іспішно, але користувач може надіслати DISCONNECT підчас сканування.
 					if(auto_reconnect_anabled == false)
 					{
-						ESP_LOGI(MANAGER_TAG, "Connect aequence canselled");
+						ESP_LOGI(MANAGER_TAG, "Connect sequence cancelled");
 						selected_ap_valid = false;
 						wifi_manager_set_state(WIFI_STATE_DISCONNECTED);
 						break;
 					}
+					
+					// Знайдено потрібну AP, Автоматично підключитися до BSSID
 					err = wifi_manager_connect_selected_ap();
 					if(err != ESP_OK)
 					{
-						ESP_LOGE(MANAGER_TAG, "Connect selected AP failed");
+						ESP_LOGW(MANAGER_TAG, "Target AP not found");
+						selected_ap_valid = false;
+						
 						wifi_manager_set_state(WIFI_STATE_DISCONNECTED);
+						
+						if(auto_reconnect_anabled == false)
+						{
+							ESP_LOGI(MANAGER_TAG, "Auto recovety disabled");
+							break;
+						}
+						
+						// До MAX рахуємо fast recovery attempts.
+						// Після MAX counter більше не збільшуємо
+						if(reconnect_attempts < MAX_RECONNEKT_ATTEMPTS)
+						{
+							reconnect_attempts++;
+						}
+						if(wifi_manager_scedule_recovery(WIFI_RECOVERY_ACTION_RESCAN) == false)
+						{
+							ESP_LOGE(MANAGER_TAG, "Failed to scedule scan recovery");
+						}
+						break;
 					}
+
 				}
 				break;	
 			}
@@ -846,7 +995,7 @@ static void wifi_manager_task(void *parameters)
 
 
 			// COMMANDS FROM Outside //////////////////////////////////////////////////////////////////////////
-			case WIFI_MANAGER_CMD_CONNECT:
+			case WIFI_MANAGER_CMD_CONNECT:     // Команда запуску процесу сканування всіх AP
 			{
 				ESP_LOGI(MANAGER_TAG, "WIFI_MANAGER_SMD_CONNECT command received");
 
@@ -859,23 +1008,26 @@ static void wifi_manager_task(void *parameters)
 				
 				// Manual connect endbles automatic recowert again
 				auto_reconnect_anabled = true;
-				reconnect_attempts = 1;
+				pending_recovery_action = WIFI_RECOVERY_ACTION_NONE;
+				reconnect_attempts = 0;   
+				same_ap_reconnect_attempts = 0;
 				
 				// Cansel pending automatic reconnect
 				if(wifi_reconnect_timmer != NULL)
 				{
 					xTimerStop(wifi_reconnect_timmer, 0);
 				}
-				wifi_manager_start_connect_sequance();
+				wifi_manager_start_ap_selection();
 				break;	
 			}
 				
 				
-			case WIFI_MANAGER_CMD_DISCONNECT:
+			case WIFI_MANAGER_CMD_DISCONNECT:		// Команда відключитися від AP
 			{
 				ESP_LOGI(MANAGER_TAG, "WIFI_MANAGER_SMD_DISCONNECT command received");
 			
 				auto_reconnect_anabled = false;
+				pending_recovery_action = WIFI_RECOVERY_ACTION_NONE;
 					
 				// Cansel pending reconnect if one exists
 				if(wifi_reconnect_timmer != NULL)
@@ -909,7 +1061,7 @@ static void wifi_manager_task(void *parameters)
 				break;
 			}
 				
-			case WIFI_MANAGER_CMD_SCAN:
+			case WIFI_MANAGER_CMD_SCAN:			// Коменда простого стканування без підключення до AP
 			{
 				ESP_LOGI(MANAGER_TAG, "MANAGER: WIFI_MANAGER_CMD_SCAN event");
 				
@@ -936,29 +1088,57 @@ static void wifi_manager_task(void *parameters)
 		
 			case WIFI_MANAGER_CMD_RECONNECT:
 			{
-				ESP_LOGI(MANAGER_TAG, "WIFI_MANAGER_SMD_RECONNECT command received");
+				ESP_LOGI(MANAGER_TAG, "WIFI_MANAGER_CMD_RECONNECT received");
 				
 				if(auto_reconnect_anabled == false)
 				{
-					ESP_LOGI(MANAGER_TAG, "Autoreconnect ignored: autoreconnect disabled");
-					break;
-				}
-				if(wifi_state != WIFI_STATE_DISCONNECTED)
-				{
-					ESP_LOGW(MANAGER_TAG, "Reconnect ignored in state %s", wifi_state_to_string(wifi_state));
+					ESP_LOGI(MANAGER_TAG, "Recovery ignored: disabled");
+					pending_recovery_action = WIFI_RECOVERY_ACTION_NONE;
 					break;
 				}
 				
-				if(reconnect_attempts >= MAX_RECONNEKT_ATTEMPTS)
+				if(wifi_state != WIFI_STATE_DISCONNECTED)		// Має бути відключений від AP
 				{
-					ESP_LOGW(MANAGER_TAG, "Maximum reconnect attempts reached");
+					ESP_LOGI(MANAGER_TAG, "Recovery ignored in state = %s", wifi_state_to_string(wifi_state));
 					break;
 				}
+			
+				wifi_recovery_action_t action = pending_recovery_action;
+				
+				// Поточна команда вже забрала action
+				pending_recovery_action = WIFI_RECOVERY_ACTION_NONE;
+				
+				switch(action)
+				{
+					case WIFI_RECOVERY_ACTION_DIRECT_RECONNECT:
+					{
+						if(selected_ap_valid == false)
+						{
+							ESP_LOGI(MANAGER_TAG, "Selected AP invalid -> RESCAN");
+							wifi_manager_start_ap_selection();
+							break;
+						}
+						wifi_manager_reconnect_to_current_ap();
+						break;
+					}
+							
+					case WIFI_RECOVERY_ACTION_RESCAN:
+					{
+						ESP_LOGI(MANAGER_TAG, "Execute recovery: RESCAN");
+						wifi_manager_start_ap_selection();
+						break;
+					}
 					
-				wifi_manager_start_connection();
-				break;	
+					case WIFI_RECOVERY_ACTION_STOP:	
+					case WIFI_RECOVERY_ACTION_NONE:
+					default:
+					{
+						ESP_LOGW(MANAGER_TAG, "No pending recowery action");
+						break;
+					}
+				}
+				break;
 			}
-				
 		}
 	}
 }
@@ -1270,7 +1450,7 @@ static void test_task(void *parameters)
 	
 		ESP_LOGI(TAG, ">>>>>>>>>>>>>>> Send CONNECT command");
 		wifi_manager_connect();
-		if(rest_wait_for_state(WIFI_STATE_CONNECTED, 15000))
+		if(rest_wait_for_state(WIFI_STATE_ONLINE, 45000))
 		{
 			ESP_LOGI(TAG, "STATUS: TEST CONNECT TO AP: Pass.");
 		}
@@ -1316,7 +1496,19 @@ void app_main(void)
 	ESP_LOGI(TAG, "WiFi STA initialized complited"); 
 	
 	////////// Test task
+	
+	vTaskDelay(pdMS_TO_TICKS(5000));
 	//xTaskCreatePinnedToCore(test_task, "test_task", 2048, NULL, 3, NULL, TEST_CORE);
+	
+	
+	
+	/////////////////////////////////////////////////////////////////////////////////
+ 
+	
+	
+	
+	
+	
 	
 
 }
